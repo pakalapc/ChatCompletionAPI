@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+.env
+.env.*
+!.env.example
+*.md
+.cursor
+.vscode
+**/terminals

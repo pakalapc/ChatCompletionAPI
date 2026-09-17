@@ -263,9 +263,23 @@ def chat_once(
     client: OpenAI,
     messages: list[dict],
     model: str = "gpt-4o-mini",
+    *,
+    conversation_id: str | None = None,
+    turn_id: str | None = None,
 ) -> str:
-    """Send full history; resolve any tool calls; return the final assistant reply."""
+    """Send full history; resolve any tool calls; return the final assistant reply.
+
+    When conversation_id and turn_id are provided, persists llm_call / tool_call /
+    final_render steps and updates turn token usage at the end.
+    """
+    from db.db_helpers import persist_step
+
+    persist = bool(conversation_id and turn_id)
+    input_tokens = 0
+    output_tokens = 0
+
     for _ in range(MAX_TOOL_ROUNDS):
+        llm_input = {"model": model, "messages": messages}
         response = client.chat.completions.create(
             model=model,
             temperature=0.3,
@@ -273,6 +287,11 @@ def chat_once(
             tools=WEATHER_TOOLS,
             tool_choice="auto",
         )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+            output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+
         message = response.choices[0].message
         tool_calls = message.tool_calls or []
 
@@ -294,11 +313,54 @@ def chat_once(
             ]
         messages.append(assistant_message)
 
+        persist_step(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            step_type="llm_call",
+            input_data=llm_input,
+            output_data={
+                "content": message.content,
+                "tool_calls": assistant_message.get("tool_calls"),
+                "usage": {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+                    "completion_tokens": (
+                        getattr(usage, "completion_tokens", None) if usage else None
+                    ),
+                },
+            },
+        )
+
         if not tool_calls:
-            return (message.content or "").strip()
+            reply = (message.content or "").strip()
+            persist_step(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                step_type="final_render",
+                input_data={"source": "assistant_message"},
+                output_data={"reply": reply},
+            )
+            if persist:
+                from db import touch_conversation, update_turn_usage
+
+                update_turn_usage(turn_id, input_tokens, output_tokens)  # type: ignore[arg-type]
+                touch_conversation(conversation_id)  # type: ignore[arg-type]
+            return reply
 
         for call in tool_calls:
-            tool_output = _run_tool(call.function.name, call.function.arguments or "{}")
+            tool_args = call.function.arguments or "{}"
+            tool_input = {
+                "tool_name": call.function.name,
+                "arguments": tool_args,
+                "tool_call_id": call.id,
+            }
+            tool_output = _run_tool(call.function.name, tool_args)
+            persist_step(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                step_type="tool_call",
+                input_data=tool_input,
+                output_data={"result": tool_output},
+            )
             messages.append(
                 {
                     "role": "tool",
@@ -307,7 +369,199 @@ def chat_once(
                 }
             )
 
-    return "I hit the tool-call limit before finishing. Please try asking again."
+    reply = "I hit the tool-call limit before finishing. Please try asking again."
+    persist_step(
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        step_type="final_render",
+        input_data={"source": "tool_limit"},
+        output_data={"reply": reply},
+    )
+    if persist:
+        from db import touch_conversation, update_turn_usage
+
+        update_turn_usage(turn_id, input_tokens, output_tokens)  # type: ignore[arg-type]
+        touch_conversation(conversation_id)  # type: ignore[arg-type]
+    return reply
+
+
+def chat_stream(
+    client: OpenAI,
+    messages: list[dict],
+    model: str = "gpt-4o-mini",
+    *,
+    conversation_id: str | None = None,
+    turn_id: str | None = None,
+):
+    """Like chat_once, but yields SSE-friendly event dicts.
+
+    Event types:
+      - status: {"type":"status","message": "..."}
+      - token:  {"type":"token","text": "..."}
+      - done:   {"type":"done","reply": "..."}
+      - error:  {"type":"error","message": "..."}
+    """
+    from db.db_helpers import persist_step
+
+    persist = bool(conversation_id and turn_id)
+    input_tokens = 0
+    output_tokens = 0
+
+    def _finish_usage() -> None:
+        if persist:
+            from db import touch_conversation, update_turn_usage
+
+            update_turn_usage(turn_id, input_tokens, output_tokens)  # type: ignore[arg-type]
+            touch_conversation(conversation_id)  # type: ignore[arg-type]
+
+    try:
+        for _ in range(MAX_TOOL_ROUNDS):
+            llm_input = {"model": model, "messages": messages}
+            yield {"type": "status", "message": "Thinking…"}
+
+            stream = client.chat.completions.create(
+                model=model,
+                temperature=0.3,
+                messages=messages,
+                tools=WEATHER_TOOLS,
+                tool_choice="auto",
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            content_parts: list[str] = []
+            # tool_index -> {id, name, arguments}
+            tool_acc: dict[int, dict[str, str]] = {}
+            usage = None
+
+            for chunk in stream:
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage
+
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+
+                if delta.content:
+                    content_parts.append(delta.content)
+                    # Stream tokens only while this looks like a final text reply.
+                    # If tool_calls show up later in the same stream, we stop yielding.
+                    if not tool_acc:
+                        yield {"type": "token", "text": delta.content}
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = tool_acc.setdefault(
+                            idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                slot["name"] = tc.function.name
+                            if tc.function.arguments:
+                                slot["arguments"] += tc.function.arguments
+
+            if usage is not None:
+                input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+                output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+
+            content = "".join(content_parts)
+            tool_calls_list = [
+                {
+                    "id": slot["id"] or f"call_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": slot["name"],
+                        "arguments": slot["arguments"] or "{}",
+                    },
+                }
+                for idx, slot in sorted(tool_acc.items())
+                if slot["name"]
+            ]
+
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": content or None,
+            }
+            if tool_calls_list:
+                assistant_message["tool_calls"] = tool_calls_list
+            messages.append(assistant_message)
+
+            persist_step(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                step_type="llm_call",
+                input_data=llm_input,
+                output_data={
+                    "content": content or None,
+                    "tool_calls": tool_calls_list or None,
+                    "usage": {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+                        "completion_tokens": (
+                            getattr(usage, "completion_tokens", None) if usage else None
+                        ),
+                    },
+                },
+            )
+
+            if not tool_calls_list:
+                reply = content.strip()
+                persist_step(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    step_type="final_render",
+                    input_data={"source": "assistant_message"},
+                    output_data={"reply": reply},
+                )
+                _finish_usage()
+                yield {"type": "done", "reply": reply}
+                return
+
+            for call in tool_calls_list:
+                name = call["function"]["name"]
+                tool_args = call["function"]["arguments"]
+                yield {
+                    "type": "status",
+                    "message": f"Using tool `{name}`…",
+                }
+                tool_input = {
+                    "tool_name": name,
+                    "arguments": tool_args,
+                    "tool_call_id": call["id"],
+                }
+                tool_output = _run_tool(name, tool_args)
+                persist_step(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    step_type="tool_call",
+                    input_data=tool_input,
+                    output_data={"result": tool_output},
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": tool_output,
+                    }
+                )
+
+        reply = "I hit the tool-call limit before finishing. Please try asking again."
+        yield {"type": "token", "text": reply}
+        persist_step(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            step_type="final_render",
+            input_data={"source": "tool_limit"},
+            output_data={"reply": reply},
+        )
+        _finish_usage()
+        yield {"type": "done", "reply": reply}
+    except Exception as exc:
+        yield {"type": "error", "message": str(exc)}
 
 
 def main() -> None:

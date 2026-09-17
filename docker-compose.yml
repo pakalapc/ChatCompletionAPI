@@ -1,0 +1,77 @@
+# Local orchestration for Weather Chat services.
+# Each service has its own Dockerfile under services/ so the same images
+# can later be deployed to Minikube/Kubernetes independently.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: weather-chat-db
+    environment:
+      POSTGRES_USER: weather
+      POSTGRES_PASSWORD: weather
+      POSTGRES_DB: weather_chat
+    ports:
+      - "5432:5432"
+    volumes:
+      - weather_pg_data:/var/lib/postgresql/data
+      - ./services/api/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather -d weather_chat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: weather-chat-api:local
+    container_name: weather-chat-api
+    env_file:
+      - .env
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY:-}
+      DATABASE_URL: postgresql://weather:weather@db:5432/weather_chat
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: services/ui/Dockerfile
+    image: weather-chat-ui:local
+    container_name: weather-chat-ui
+    environment:
+      WEATHER_API_BASE_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  default:
+    name: weather-chat-net
+
+volumes:
+  weather_pg_data:
